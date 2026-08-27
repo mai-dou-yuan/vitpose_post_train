@@ -1,0 +1,87 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+
+venv/
+.venv/
+env/
+.env/
+conda-env/
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Model weights
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+*.engine
+*.tflite
+
+# Training outputs
+outputs/
+output/
+checkpoints/
+checkpoint/
+weights/
+runs/
+logs/
+log/
+lightning_logs/
+**/lightning_logs/
+wandb/
+**/wandb/
+tensorboard/
+
+# Dataset
+data/
+dataset/
+datasets/
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.mat
+*.arrow
+*.parquet
+*.pkl
+*.pickle
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Generated videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Cache
+.cache/
+tmp/
+temp/
+*.tmp
+.ipynb_checkpoints/
+
+# Generated experiment directories
+**/outputs/
+**/checkpoints/
+**/weights/
+**/runs/

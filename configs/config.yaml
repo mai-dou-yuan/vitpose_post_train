@@ -1,0 +1,32 @@
+# 数据配置
+data:
+  # root: "/home/zhucong/Downloads/Downloads_tmp/egoposeformer-main/save_path_1(split)"
+  root: "/home/duanmu/data/vitpose_v3/vitpose_v3/save_path_15"
+  train_dir: "train"
+  val_dir: "val"
+  test_dir: "test"
+  image_size: 336
+  # image_size: 224
+
+# 训练配置
+training:
+  batch_size: 24
+  max_epochs: 100
+  num_workers: 8
+  learning_rate: 0.0001
+  train_stage: "3d"
+  
+# 模型配置
+model:
+  local_model_dir: "./dinov2-base-local"
+  fastvit_ckpt_path: "./pretrained_weights/fastvit_ma36_apple_in1k.safetensors"
+  # ckpt_path: "checkpoints/pose2d1_9.ckpt"
+  # ckpt_path: "checkpoints/pose-epoch=41-val_loss=0.0020-v1.ckpt"
+  # ckpt_path: "checkpoints/pose-epoch=21-val_loss=7.6972.ckpt"
+  # ckpt_path: "checkpoints/pose-epoch=25-val_mpjpe_3d=17.6555.ckpt"
+  # ckpt_path: "checkpoints/pose-epoch=19-val_mpjpe_3d=17.6038.ckpt"
+  # ckpt_path: "checkpoints/pose-epoch=27-val_mpjpe_3d=18.5641.ckpt"
+  ckpt_path: ""
+
+# 随机种子
+seed: 42

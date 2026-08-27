@@ -1,0 +1,642 @@
+# pl_system.py
+import math
+import pdb
+import torch
+import torch.nn as nn
+import pytorch_lightning as pl
+from models.model_PoseEstimationModel import PoseEstimationModel
+from models.model_vit import ViTFeatureExtractor
+from models.pose_2d_decoder import ViTPose2D_Decoder
+from models.heatmap_decoder import HeatmapDecoder
+from models.model_PoseEstimationModel import ViTPoseFusionBlock
+from utils.generate_target_heatmaps import generate_target_heatmaps
+from utils.sample_features_at_points import sample_features_at_points
+from models.UpsampleHead4x import UpsampleHead4x
+from models.GatedMultiHeadAttention import GatedMultiHeadAttention
+from models.ChannelWiseGatedFusion import ChannelWiseGatedFusion
+from utils.PositionEmbeddingSine import PositionEmbeddingSine
+from models.Pose3DRegressionHead import Pose3DRegressionHead
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        return self._norm(x.float()).type_as(x) * self.weight
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, hidden_dim, bias=False):
+        super().__init__()
+        # 对应图中的 Gate 路径 和 Up 路径
+        # 通常 hidden_dim 会设为 d_model 的 8/3 倍或 4 倍
+        self.w_gate = nn.Linear(d_model, hidden_dim, bias=bias)
+        self.w_up   = nn.Linear(d_model, hidden_dim, bias=bias)
+        
+        # 对应图中的 Down 路径
+        self.w_down = nn.Linear(hidden_dim, d_model, bias=bias)
+        self.act = nn.SiLU() # Qwen/Llama 标配激活函数
+
+    def forward(self, x):
+        # 结构：(SiLU(Gate(x)) * Up(x)) -> Down
+        return self.w_down(self.act(self.w_gate(x)) * self.w_up(x))
+
+class PoseRefinementLayer(nn.Module):
+    def __init__(self, d_model, n_head=8, dim_feedforward=None, dropout=0.2):
+        super().__init__()
+        
+        if dim_feedforward is None:
+            dim_feedforward = int(d_model * 4)
+        
+        # Attention 相关的 Norm (Pre-Norm 结构)
+        self.norm_attn_in = RMSNorm(d_model)
+        
+        # QK-Norm: 稳定深层网络的注意力计算
+        self.norm_q = RMSNorm(d_model)
+        self.norm_k = RMSNorm(d_model)
+
+        self.cross_attention = GatedMultiHeadAttention(
+            d_model=d_model, 
+            n_head=n_head, 
+            dropout=dropout
+        )
+        
+        # MLP 相关的 Norm
+        self.norm_mlp_in = RMSNorm(d_model)
+        
+        # MLP (SwiGLU 结构)
+        self.mlp = SwiGLU(d_model, dim_feedforward)
+        
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, tgt, memory, query_pos=None, memory_pos=None):
+        """
+        tgt:        [B, N, C]       - 目标序列 (Query Stream / Residual Stream)
+        memory:     [B, C, H, W]    - 记忆库/上下文 (Context Stream)，此处保留 2D 结构处理逻辑
+        query_pos:  [B, N, C]       - Query 的位置编码
+        memory_pos: [B, C, H, W]    - Memory 的位置编码
+        """
+        
+        # ====== Block 1: Attention (Cross-Attention) ======
+        # 1. Pre-Norm
+        tgt_norm = self.norm_attn_in(tgt)
+        
+        # 2. 准备 Q, K, V
+        # --- Query 路径 ---
+        # 只有内容部分经过 Q-Norm
+        q_content = self.norm_q(tgt_norm) 
+        query = q_content + (query_pos if query_pos is not None else 0)
+        
+        # --- Key / Value 路径 (针对 2D Feature Map 的通用展平处理) ---
+        # 如果 memory 已经是 [B, S, C]，可以跳过 permute 和 flatten
+        if memory.dim() == 4:
+            # [B, C, H, W] -> [B, H*W, C]
+            memory_flatten = memory.permute(0, 2, 3, 1).flatten(1, 2)
+            if memory_pos is not None:
+                m_pos_flatten = memory_pos.permute(0, 2, 3, 1).flatten(1, 2)
+            else:
+                m_pos_flatten = 0
+        else:
+            memory_flatten = memory
+            m_pos_flatten = memory_pos if memory_pos is not None else 0
+
+        # Key 内容经过 K-Norm
+        k_content = self.norm_k(memory_flatten) 
+        key = k_content + m_pos_flatten
+        
+        # Value 保持原样 (通常 Value 不做 QK-Norm)
+        value = memory_flatten
+        
+        # 3. Cross Attention 计算
+        attn_out = self.cross_attention(
+            query=query,
+            key=key,
+            value=value,
+            is_causal=False
+        )
+        
+        # 4. 第一个残差连接
+        tgt = tgt + self.dropout(attn_out)
+        
+        
+        # ====== Block 2: MLP (SwiGLU) ======
+        # 5. Pre-Norm
+        mlp_in = self.norm_mlp_in(tgt)
+        
+        # 6. Feed Forward (SwiGLU)
+        mlp_out = self.mlp(mlp_in)
+        
+        # 7. 第二个残差连接
+        tgt = tgt + self.dropout(mlp_out)
+        
+        return tgt
+
+class PoseSelfAttentionLayer(nn.Module):
+    def __init__(self, d_model, n_head=8, dim_feedforward=None, dropout=0.2):
+        super().__init__()
+        if dim_feedforward is None:
+            dim_feedforward = int(d_model * 4)
+
+        # Pre-Norm 结构
+        self.norm_attn_in = RMSNorm(d_model)
+        self.norm_q = RMSNorm(d_model)
+        self.norm_k = RMSNorm(d_model)
+
+        self.self_attention = GatedMultiHeadAttention(
+            d_model=d_model, 
+            n_head=n_head, 
+            dropout=dropout
+        )
+        
+        self.norm_mlp_in = RMSNorm(d_model)
+        self.mlp = SwiGLU(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, pos=None):
+        """
+        x: [B, N, C] - 关节特征点序列 (N=21)
+        pos: [B, N, C] - 关节对应的位置编码
+        """
+        # Block 1: Self-Attention ---
+        residual = x
+        x = self.norm_attn_in(x)
+        
+        # 准备 Q, K, V
+        # Q 和 K 加入位置编码，V 保持原样
+        q = self.norm_q(x) + (pos if pos is not None else 0)
+        k = self.norm_k(x) + (pos if pos is not None else 0)
+        v = x
+        
+        attn_out = self.self_attention(
+            query=q,
+            key=k,
+            value=v,
+            is_causal=False
+        )
+        x = residual + self.dropout(attn_out)
+
+        # Block 2: MLP (SwiGLU) ---
+        residual = x
+        x = self.norm_mlp_in(x)
+        x = self.mlp(x)
+        x = residual + self.dropout(x)
+        
+        return x
+
+class PoseLightningModule(pl.LightningModule):
+    def __init__(self, lr=1e-3, num_joints=21, local_model_dir=None, feature_dim=768, layers=[3, 6, -1],
+                  upsample_dim=256, num_refine_layers=2, train_stage='2d'):
+        super().__init__()
+        self.save_hyperparameters() 
+        self.layers = layers
+        self.upsample_dim = upsample_dim
+        self.train_stage = train_stage
+        
+        
+        self.point_feature_fusion = ChannelWiseGatedFusion(channel_dim=upsample_dim, num_levels=len(layers))
+        # 1. 初始化模型
+        self.vitmodel = ViTFeatureExtractor(
+            model_name_or_path=local_model_dir, 
+            layers_to_extract=[3, 6, -1],
+            freeze_backbone=True
+        )
+        
+        
+        self.decoder_pose2d_heatmap = ViTPose2D_Decoder(
+            in_channels=768,
+            hidden_channels=256,
+            out_channels=num_joints,
+            patch_size=14,
+            img_size=(224, 224)
+        )
+        self.decoder_pose2d = HeatmapDecoder(
+            use_dark=True,
+            sigma=2,
+            blur_kernel=11
+        )
+        
+        # 冻结 2D 相关模块的参数
+        # for param in self.decoder_pose2d_heatmap.parameters():
+        #     param.requires_grad = False
+
+        self.fuse_block = ViTPoseFusionBlock(
+            in_channels_list=[self.upsample_dim, self.upsample_dim, self.upsample_dim], 
+            hidden_dim=128,  # 中间层维度，可以设为 128 或 256
+            out_dim=256      
+        )
+        self.upsample_dim = upsample_dim
+        self.upsample_heads = nn.ModuleList([
+            UpsampleHead4x(
+                in_channels=feature_dim, 
+                out_channels=self.upsample_dim, 
+                hidden_dim=256
+            )
+            for _ in range(len(layers))
+        ])
+        
+        
+        # 位置编码生成，upsample_dim 必须是偶数
+        self.pos_embed_layer = PositionEmbeddingSine(num_pos_feats=upsample_dim // 2, normalize=True)
+    
+
+        self.refine_layers_crossattn = nn.ModuleList([
+            PoseRefinementLayer(
+                d_model=upsample_dim,       # 256
+                n_head=8, 
+                dim_feedforward=1024,       # 新增: 256 * 4
+                dropout=0.2,
+            )
+            for _ in range(num_refine_layers)
+        ])
+        #  Self-Attention 层
+        self.refine_layers_selfattn = nn.ModuleList([
+            PoseSelfAttentionLayer(
+                d_model=upsample_dim,       # 256
+                n_head=8, 
+                dim_feedforward=1024,
+                dropout=0.2,
+            )
+            for _ in range(num_refine_layers)
+        ])
+        
+        
+        # Regression Head
+        self.pose_3d_head_PR = Pose3DRegressionHead(
+            in_channels=256, 
+            mid_channels=128, 
+            out_channels=6,
+            dropout=0.2,
+        )
+        # 损失函数
+        self.criterion = nn.MSELoss()
+        # 根据 stage 设置冻结状态
+        self._set_freeze_status()
+    def _set_freeze_status(self):
+        """根据 train_stage 冻结/解冻 参数"""
+        # 1. 默认冻结 Backbone (ViT)
+        for param in self.vitmodel.parameters():
+            param.requires_grad = False
+            
+        if self.train_stage == '2d':
+            print("Training Mode: 2D Stage (Training Heatmap Decoder, Freezing 3D Modules)")
+            # 解冻 2D Decoder
+            for param in self.decoder_pose2d_heatmap.parameters():
+                param.requires_grad = True
+            
+            # 冻结所有 3D 模块
+            modules_to_freeze = [
+                self.upsample_heads, self.fuse_block, self.point_feature_fusion,
+                self.pos_embed_layer, self.refine_layers_crossattn,
+                self.refine_layers_selfattn, self.pose_3d_head_PR
+            ]
+            for module in modules_to_freeze:
+                for param in module.parameters():
+                    param.requires_grad = False
+                    
+        elif self.train_stage == '3d':
+            print("Training Mode: 3D Stage (Training 3D Modules, Freezing 2D Decoder)")
+            # 冻结 2D Decoder (信任已经训练好的 2D 结果)
+            for param in self.decoder_pose2d_heatmap.parameters():
+                param.requires_grad = False
+            
+            # 解冻 3D 模块
+            modules_to_unfreeze = [
+                self.upsample_heads, self.fuse_block, self.point_feature_fusion,
+                self.pos_embed_layer, self.refine_layers_crossattn,
+                self.refine_layers_selfattn, self.pose_3d_head_PR
+            ]
+            for module in modules_to_unfreeze:
+                for param in module.parameters():
+                    param.requires_grad = True
+        else:
+            raise ValueError(f"Unknown train_stage: {self.train_stage}")
+    
+    def _compute_gnll_loss(self, pred_mu, pred_logvar, gt):
+        """
+        计算 Gaussian Negative Log Likelihood Loss
+        Loss = 0.5 * (exp(-s) * (mu - y)^2 + s)
+        其中 s = log(sigma^2)
+        """
+        # 1. 计算均方误差项 (mu - y)^2
+        mse_term = (pred_mu - gt) ** 2
+        
+        # 2. 计算方差倒数 exp(-s) = 1/sigma^2
+        precision = torch.exp(-pred_logvar)
+        
+        # 3. 组合 Loss
+        loss = 0.5 * (precision * mse_term + pred_logvar)
+        
+        # 对所有维度取平均 (Batch, Joints, 3)
+        return loss.mean()
+    def forward(self, x):
+        
+        results = {}
+        # 特征提取
+        features_dict = self.vitmodel(x) # dict_keys([3, 6, -1]), torch.Size([16, 257, 768])
+        feature_deep = features_dict[-1] # torch.Size([16, 21, 2])
+       
+        # 回归2d坐标
+        pose2d_heatmap = self.decoder_pose2d_heatmap(feature_deep) # torch.Size([16, 21, 64, 64])
+        results["pose2d_heatmap"] = pose2d_heatmap # 保存 heatmap 用于 loss
+        img_w = x.shape[3] 
+        hm_w = pose2d_heatmap.shape[3]
+        scale_factor = img_w / hm_w  # 224 / 64 = 3.5
+        pose2d, scores = self.decoder_pose2d.decode(pose2d_heatmap, img_scale_factor=scale_factor) # torch.Size([16, 21, 2])
+        
+        # 如果在 3D 训练阶段，可以 detach 2D 的结果，防止梯度回传
+        if self.train_stage == '3d':
+            pose2d = pose2d.detach()
+            pose2d_heatmap = pose2d_heatmap.detach()
+
+
+        # token特征重构回图像尺寸
+        extracted_features = []
+        for layer_id in self.layers:
+            feat = features_dict[layer_id]
+            patch_tokens = feat[:, 1:, :] # 去除 CLS
+            patch_tokens = patch_tokens.transpose(1, 2) # [B, C, N]
+            
+            B, C, N = patch_tokens.shape
+            H = W = int(math.sqrt(N))
+            feature_map = patch_tokens.view(B, C, H, W)
+            
+            extracted_features.append(feature_map)
+        
+        # 特征融合
+        # fused_map = self.fusion_block(extracted_features) # torch.Size([16, 512, 16, 16])
+        # 对 extracted_features 特征进行上采样,遍历三个层级的特征，分别通过对应的 upsample_head
+        upsampled_features = []
+        for i, feat in enumerate(extracted_features):
+            # feat shape: [B, 768, 16, 16]
+            # up_feat shape: [B, 256, 64, 64] (upsample_dim=256)
+            up_feat = self.upsample_heads[i](feat)
+            upsampled_features.append(up_feat)
+        
+        
+        #  在上采样后的特征图上采样,并在 64x64 的特征图上进行 grid_sample，获得更精细的特征
+        joint_features_shallow = sample_features_at_points(upsampled_features[0], pose2d, img_size=(224, 224)) # torch.Size([16, 21, 256])
+        joint_features_middle = sample_features_at_points(upsampled_features[1], pose2d, img_size=(224, 224)) # torch.Size([16, 21, 256])
+        joint_features_deep  = sample_features_at_points(upsampled_features[2], pose2d, img_size=(224, 224)) # torch.Size([16, 21, 256])
+        
+        # 可选,拼接这些特征
+        # fused_point_features = torch.cat([joint_features_shallow, joint_features_middle, joint_features_deep], dim=-1)
+        
+        # 将三个特征传入融合模块, used_point_features: [B, 21, 256]
+        fused_point_features = self.point_feature_fusion(
+            [joint_features_shallow, joint_features_middle, joint_features_deep]
+        )
+
+
+        # 将三层 upsampled features 相加融合，作为全局上下文
+        # global_feature_map = upsampled_features[0] + upsampled_features[1] + upsampled_features[2] 
+        global_feature_map = self.fuse_block(upsampled_features) # [B, 256, 64, 64]
+
+
+
+        # 生成位置编码 (Positional Encodings)，pos_embed_map: [B, 256, 64, 64]
+        pos_embed_map = self.pos_embed_layer(global_feature_map)
+        
+        # 生成 Query 点的 PE
+        # 直接在 Map PE 上采样 pose2d 位置，保证 Q 和 K 的位置对齐
+        # pos_embed_point: [B, 21, 256]
+        pos_embed_point = sample_features_at_points(           
+            pos_embed_map, 
+            pose2d, 
+            img_size=(224, 224)
+        ) 
+        
+        # 使用transformer
+        fused_point_features = fused_point_features
+        curr_point_features = fused_point_features
+        for layer in self.refine_layers_crossattn:
+            curr_point_features = layer(
+                tgt=curr_point_features,
+                memory=global_feature_map,
+                query_pos=pos_embed_point,
+                memory_pos=pos_embed_map
+            )
+               
+        # 用于存储中间层的预测结果
+        all_stage_preds = []
+        all_stage_logvars = []
+        # Self-Attention 阶段
+        for layer in self.refine_layers_selfattn:
+            curr_point_features = layer(
+                x=curr_point_features,
+                pos=pos_embed_point
+            )
+            # 每一层过完后，都预测一次 3D 姿态
+            # out shape: [B, 21, 6]
+            raw_pred = self.pose_3d_head_PR(curr_point_features) 
+            
+            # 拆分均值和方差
+            stage_pred_mu = raw_pred[..., :3]      # 前3维：坐标
+            stage_pred_logvar = raw_pred[..., 3:]  # 后3维：log方差
+            
+            all_stage_preds.append(stage_pred_mu)
+            all_stage_logvars.append(stage_pred_logvar)
+            
+        
+        # 取最后一个作为最终结果
+        pred_pose_3d = all_stage_preds[-1]
+        pred_logvar_3d = all_stage_logvars[-1]
+
+        results["pose3d"] = pred_pose_3d 
+        results["pose3d_logvar"] = pred_logvar_3d # 新增
+        results["all_stage_pose3d"] = all_stage_preds 
+        results["all_stage_logvars"] = all_stage_logvars # 新增
+        results["pose2d"] = pose2d
+        
+        return results
+
+    def _compute_mpjpe_2d(self, pred, gt):
+        # 2D 专用：过滤图像范围外的点
+        valid_mask = (gt[..., 0] >= 0) & (gt[..., 0] <= 224) & \
+                     (gt[..., 1] >= 0) & (gt[..., 1] <= 224)
+        dist = torch.norm(pred - gt, dim=-1)
+        if valid_mask.sum() > 0:
+            return dist[valid_mask].mean()
+        else:
+            return torch.tensor(0.0, device=pred.device)
+
+    def _compute_mpjpe_3d(self, pred, gt):
+        # 3D 专用：通常不需要像 2D 那样过滤范围，除非数据集中用 -10000 标记无效点
+        # 假设 gt 中没有任何无效点，或者无效点用极小值标记(需根据你数据集的情况调整)
+        
+        # 如果你的数据集用 NaN 或特定的非常小的值(如 -1000)表示无效 3D 点：
+        # valid_mask = gt[..., 2] > -900 # 举例
+        
+        # 这里假设 GT 都是有效的 (通常 3D 数据集会保证这点)
+        dist = torch.norm(pred - gt, dim=-1)
+        return dist.mean()
+    
+    def training_step(self, batch, batch_idx):
+        imgs = batch['img'] 
+        gt_pose = batch['gt_pose'] 
+        gt_pose_2d = batch['gt_pose_2d'] # [B, 21, 2] 坐标
+        
+        results = self(imgs)
+        
+        # Case 1: 训练 2D 阶段
+        if self.train_stage == '2d':
+            pred_heatmap = results['pose2d_heatmap']
+            
+            # 动态生成 GT Heatmap
+            with torch.no_grad():
+                target_heatmap = generate_target_heatmaps(
+                    gt_pose_2d, 
+                    input_size=(224, 224), 
+                    heatmap_size=(64, 64),
+                    sigma=2
+                )
+
+            loss_2d = self.criterion(pred_heatmap, target_heatmap)
+            
+            self.log('train_loss', loss_2d, prog_bar=True)
+            self.log('loss_2d_hm', loss_2d, prog_bar=True)
+            
+            # 计算 MPJPE 看一下指标
+            with torch.no_grad():
+                mpjpe_2d = self._compute_mpjpe_2d(results['pose2d'], gt_pose_2d)
+                self.log('train_mpjpe_2d', mpjpe_2d, prog_bar=True)
+           
+            return loss_2d
+
+        # Case 2: 训练 3D 阶段
+        # elif self.train_stage == '3d':
+        #     all_preds = results['all_stage_pose3d']
+        #     loss_3d_pose = 0
+        #     for pred in all_preds:
+        #         loss_3d_pose += self.criterion(pred, gt_pose)
+        # Case 2: 训练 3D 阶段 (修改为 GNLL Loss)
+        elif self.train_stage == '3d':
+            all_preds = results['all_stage_pose3d']
+            all_logvars = results['all_stage_logvars']
+            
+            loss_3d_pose = 0
+            
+            # 对所有 Stage 进行深层监督
+            for pred_mu, pred_logvar in zip(all_preds, all_logvars):
+                # 使用GNLL Loss
+                loss_3d_pose += self._compute_gnll_loss(pred_mu, pred_logvar, gt_pose)
+            
+            self.log('train_loss', loss_3d_pose, prog_bar=True)
+            self.log('loss_3d', loss_3d_pose, prog_bar=True)
+            
+            with torch.no_grad():
+                mpjpe_3d = self._compute_mpjpe_3d(results['pose3d'], gt_pose)
+                self.log('train_mpjpe_3d', mpjpe_3d, prog_bar=True)
+
+            return loss_3d_pose
+
+    def validation_step(self, batch, batch_idx):
+        imgs = batch['img']
+        gt_pose = batch['gt_pose']
+        gt_pose_2d = batch['gt_pose_2d']
+        
+        results = self(imgs)
+        pred_pose2d = results['pose2d']
+        
+        if self.train_stage == '2d':
+            # Val 2D Logic
+            pred_heatmap = results['pose2d_heatmap']
+            with torch.no_grad():
+                target_heatmap = generate_target_heatmaps(gt_pose_2d, (224,224), (64,64), 2).to(pred_heatmap.device)
+            val_loss = self.criterion(pred_heatmap, target_heatmap)
+            
+            # 这里的 MPJPE 2D 是非常重要的指标
+            val_mpjpe_2d = self._compute_mpjpe_2d(results['pose2d'], gt_pose_2d)
+            self.log('val_loss', val_loss, prog_bar=True)
+            self.log('val_mpjpe_2d', val_mpjpe_2d, prog_bar=True)
+            
+        # elif self.train_stage == '3d':
+        #     # Val 3D Logic
+        #     pred_pose_3d = results['pose3d']
+        #     val_loss = self.criterion(pred_pose_3d, gt_pose)
+        #     val_mpjpe_3d = self._compute_mpjpe_3d(pred_pose_3d, gt_pose)
+        elif self.train_stage == '3d':
+            # Val 3D Logic
+            pred_mu = results['pose3d']
+            pred_logvar = results['pose3d_logvar']
+            # 计算 Validation Loss (GNLL)
+            val_loss = self._compute_gnll_loss(pred_mu, pred_logvar, gt_pose)  
+            # 计算MPJPE
+            val_mpjpe_3d = self._compute_mpjpe_3d(pred_mu, gt_pose)
+            
+            self.log('val_loss', val_loss, prog_bar=True)
+            self.log('val_mpjpe_3d', val_mpjpe_3d, prog_bar=True)
+    def test_step(self, batch, batch_idx):
+        imgs = batch['img']
+        gt_pose = batch['gt_pose']
+        gt_pose_2d = batch['gt_pose_2d']
+        
+        results = self(imgs)
+        pred_pose2d = results['pose2d']
+        
+        # 2D 阶段测试
+        if self.train_stage == '2d':
+            pred_heatmap = results['pose2d_heatmap']
+            with torch.no_grad():
+                target_heatmap = generate_target_heatmaps(
+                    gt_pose_2d, 
+                    (224, 224), 
+                    (64, 64), 
+                    2
+                ).to(pred_heatmap.device)
+            
+            test_loss = self.criterion(pred_heatmap, target_heatmap)
+            test_mpjpe_2d = self._compute_mpjpe_2d(results['pose2d'], gt_pose_2d)
+            
+            # 使用 'test_' 前缀记录日志
+            self.log('test_loss', test_loss, prog_bar=True)
+            self.log('test_mpjpe_2d', test_mpjpe_2d, prog_bar=True)
+
+        # 3D 阶段测试
+        elif self.train_stage == '3d':
+            pred_mu = results['pose3d']
+            pred_logvar = results['pose3d_logvar']
+            
+            # 计算 GNLL Loss
+            test_loss = self._compute_gnll_loss(pred_mu, pred_logvar, gt_pose)  
+            # 计算 MPJPE
+            test_mpjpe_3d = self._compute_mpjpe_3d(pred_mu, gt_pose)
+            
+            # 使用 'test_' 前缀记录日志
+            self.log('test_loss', test_loss, prog_bar=True)
+            self.log('test_mpjpe_3d', test_mpjpe_3d, prog_bar=True)
+    def configure_optimizers(self):
+        trainable_params = filter(lambda p: p.requires_grad, self.parameters())
+
+        optimizer = torch.optim.AdamW(
+            trainable_params, # 只传 requires_grad=True 的参数
+            lr=self.hparams.lr, 
+            weight_decay=0.04
+        )
+        
+        # Scheduler 部分保持不变，可以根据阶段调整 LR
+        max_epochs = self.trainer.max_epochs if self.trainer.max_epochs else 100
+        warmup_epochs = max(5, int(max_epochs * 0.1))
+
+        scheduler_warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.001, end_factor=1.0, total_iters=warmup_epochs
+        )
+        scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max_epochs - warmup_epochs, eta_min=1e-6
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[warmup_epochs]
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "monitor": "val_loss"
+            }
+        }

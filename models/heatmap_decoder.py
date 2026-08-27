@@ -1,0 +1,256 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+import cv2
+
+class HeatmapDecoder:
+    def __init__(self, use_dark=True, sigma=2, blur_kernel=11):
+        self.use_dark = use_dark
+        self.sigma = sigma
+        self.kernel = blur_kernel
+
+    def _get_max_preds(self, heatmaps):
+        """
+        返回:
+            preds:   [B, K, 2]  (x, y) 坐标
+            maxvals: [B, K, 1]  最大值
+            idx:     [B, K, 1]  最大值的展平索引 (用于后续 gather)
+        """
+        B, K, H, W = heatmaps.shape
+        
+        # 1. 展平 Heatmap
+        heatmaps_reshaped = heatmaps.reshape((B, K, -1))
+        
+        # 2. 找到最大值索引
+        maxvals, idx = torch.max(heatmaps_reshaped, dim=2)
+        
+        maxvals = maxvals.reshape((B, K, 1))
+        idx = idx.reshape((B, K, 1))
+        
+        # 3. 索引转坐标
+        preds = torch.tile(idx, (1, 1, 2)).float()
+        
+        preds[..., 0] = (preds[..., 0]) % W
+        preds[..., 1] = torch.floor((preds[..., 1]) / W)
+        
+        pred_mask = torch.gt(maxvals, 0.0).repeat(1, 1, 2).float()
+        preds *= pred_mask
+        
+        return preds, maxvals, idx
+
+    def _gaussian_blur(self, heatmaps):
+        B, K, H, W = heatmaps.shape
+        
+        # [关键修复] .numpy() 默认共享内存，加上 .copy() 断开连接
+        # 防止修改 hm_np 时顺带修改了外部传入的 tensor
+        hm_np = heatmaps.detach().cpu().numpy().copy() 
+        
+        for b in range(B):
+            for k in range(K):
+                hm_np[b, k] = cv2.GaussianBlur(
+                    hm_np[b, k], (self.kernel, self.kernel), self.sigma
+                )
+        return torch.from_numpy(hm_np).to(heatmaps.device)
+    def _taylor_refine(self, heatmaps, coords):
+        B, K, H, W = heatmaps.shape
+        hm = torch.clamp(heatmaps, min=1e-10)
+        hm = torch.log(hm)
+        
+        for b in range(B):
+            for k in range(K):
+                px, py = int(coords[b, k, 0]), int(coords[b, k, 1])
+                
+                # 边界检查
+                if 1 < px < W - 2 and 1 < py < H - 2:
+                    dx = 0.5 * (hm[b, k, py, px + 1] - hm[b, k, py, px - 1])
+                    dy = 0.5 * (hm[b, k, py + 1, px] - hm[b, k, py - 1, px])
+                    
+                    dxx = hm[b, k, py, px + 1] - 2 * hm[b, k, py, px] + hm[b, k, py, px - 1]
+                    dyy = hm[b, k, py + 1, px] - 2 * hm[b, k, py, px] + hm[b, k, py - 1, px]
+                    dxy = 0.25 * (hm[b, k, py + 1, px + 1] - hm[b, k, py - 1, px + 1] - 
+                                  hm[b, k, py + 1, px - 1] + hm[b, k, py - 1, px - 1])
+                    
+                    hessian = torch.tensor([[dxx, dxy], [dxy, dyy]])
+                    gradient = torch.tensor([dx, dy])
+                    
+                    try:
+                        hessian_inv = torch.inverse(hessian)
+                        offset = -torch.matmul(hessian_inv, gradient)
+                        
+                        # --- 【新增修复】 安全锁 ---
+                        # 如果偏移量超过 0.5 像素，说明泰勒展开失效（或遇到平坦区域），直接丢弃偏移
+                        if torch.max(torch.abs(offset)) < 0.5: 
+                            coords[b, k, 0] += offset[0]
+                            coords[b, k, 1] += offset[1]
+                        # 否则保持原整数坐标，不做修正
+                        # -------------------------
+                        
+                    except RuntimeError:
+                        pass
+        return coords
+    
+    def _old_taylor_refine(self, heatmaps, coords):
+        B, K, H, W = heatmaps.shape
+        hm = torch.clamp(heatmaps, min=1e-10)
+        hm = torch.log(hm)
+        
+        for b in range(B):
+            for k in range(K):
+                px, py = int(coords[b, k, 0]), int(coords[b, k, 1])
+                
+                if 1 < px < W - 2 and 1 < py < H - 2:
+                    dx = 0.5 * (hm[b, k, py, px + 1] - hm[b, k, py, px - 1])
+                    dy = 0.5 * (hm[b, k, py + 1, px] - hm[b, k, py - 1, px])
+                    
+                    dxx = hm[b, k, py, px + 1] - 2 * hm[b, k, py, px] + hm[b, k, py, px - 1]
+                    # [BUG FIX] 修正了中间项索引为 py
+                    dyy = hm[b, k, py + 1, px] - 2 * hm[b, k, py, px] + hm[b, k, py - 1, px]
+                    dxy = 0.25 * (hm[b, k, py + 1, px + 1] - hm[b, k, py - 1, px + 1] - 
+                                hm[b, k, py + 1, px - 1] + hm[b, k, py - 1, px - 1])
+                    
+                    hessian = torch.tensor([[dxx, dxy], [dxy, dyy]])
+                    gradient = torch.tensor([dx, dy])
+                    
+                    try:
+                        hessian_inv = torch.inverse(hessian)
+                        offset = -torch.matmul(hessian_inv, gradient)
+                        coords[b, k, 0] += offset[0]
+                        coords[b, k, 1] += offset[1]
+                    except RuntimeError:
+                        pass
+        return coords
+    def decode(self, heatmaps, img_scale_factor=4.0):
+        # 1. 备份原图
+        original_heatmaps = heatmaps.clone()
+
+        # 2. 高斯模糊 (为了 DARK 坐标精度)
+        if self.use_dark:
+            heatmaps = self._gaussian_blur(heatmaps)
+            
+        # 3. 在模糊图上找位置和索引
+        #    idx 是我们在 blurred map 上找到的峰值索引
+        coords, _, idx = self._get_max_preds(heatmaps) 
+        
+        # 4. [关键修复] 使用 blurred map 确定的位置索引，去 original map 拿分数
+        #    这样保证了 score 对应的是当前选定的这个点（即便是偏移后的点）
+        B, K, _ = idx.shape
+        # gather 需要维度匹配，将 idx 扩展维度
+        # original_heatmaps.view(B, K, -1) -> [B, K, H*W]
+        # gather(2, idx) -> 在最后一个维度上取值
+        scores = original_heatmaps.view(B, K, -1).gather(2, idx).view(B, K, 1)
+
+        # 5. DARK 修正 (在模糊图上做)
+        if self.use_dark:
+            coords = self._taylor_refine(heatmaps, coords)
+
+        # 6. 映射回原图
+        final_coords = coords * img_scale_factor
+
+        return final_coords, scores
+
+
+# 验证代码
+# ==========================================
+def test_case_1_standard_gaussian():
+    """
+    场景 1: 标准高斯分布
+    验证: DARK 算法能否准确还原亚像素中心 (32.4, 32.6)
+    """
+    print("\n--- Test Case 1: 标准高斯分布恢复 ---")
+    decoder = HeatmapDecoder(use_dark=True, sigma=2)
+    
+    # 手动生成一个中心在 (32.4, 32.6) 的理想高斯 Heatmap
+    size = 64
+    x0, y0 = 32.4, 32.6
+    sigma = 2
+    x = torch.arange(0, size, 1, dtype=torch.float32)
+    y = torch.arange(0, size, 1, dtype=torch.float32)
+    y_grid, x_grid = torch.meshgrid(y, x, indexing='ij')
+    heatmap = torch.exp(-((x_grid - x0)**2 + (y_grid - y0)**2) / (2 * sigma**2))
+    heatmap = heatmap.unsqueeze(0).unsqueeze(0) # [1, 1, 64, 64]
+    
+    coords, scores = decoder.decode(heatmap, img_scale_factor=1.0)
+    
+    print(f"真实目标: ({x0}, {y0})")
+    print(f"预测结果: ({coords[0,0,0]:.4f}, {coords[0,0,1]:.4f})")
+    print(f"置信度:   {scores[0,0,0]:.4f}")
+    
+    # 验证误差是否极小
+    err_x = abs(coords[0,0,0] - x0)
+    err_y = abs(coords[0,0,1] - y0)
+    if err_x < 0.05 and err_y < 0.05:
+        print("✅ 结果判定: 精度极高 (PASS)")
+    else:
+        print("❌ 结果判定: 精度不足 (FAIL)")
+
+def test_case_2_peak_shift():
+    """
+    场景 2: 重心偏移 (你的核心问题)
+    验证: 模糊后如果 Peak 从 32 移到了 33，Score 是否取的是原图 (32, 33) 的值，而不是错位值。
+    """
+    print("\n--- Test Case 2: 强干扰导致的重心偏移 ---")
+    decoder = HeatmapDecoder(use_dark=True, sigma=2)
+    
+    dummy_heatmap = torch.zeros(1, 1, 64, 64)
+    
+    # 构造冲突数据：
+    # 1. 孤立的最高点 (32, 32) = 1.0 (原图最大)
+    # 2. 右侧有一个巨大的“高原”区域，虽然单点只有 0.95，但连成一片
+    #    高斯模糊会偏向能量密集的区域，可能会把中心拉向右边 (32, 33) 或 (32, 34)
+    dummy_heatmap[0, 0, 32, 32] = 1.0   # 原始峰值 (孤立)
+    dummy_heatmap[0, 0, 32, 33] = 0.95  # 干扰
+    dummy_heatmap[0, 0, 32, 34] = 0.95  # 干扰
+    dummy_heatmap[0, 0, 32, 35] = 0.95  # 干扰
+    
+    coords, scores = decoder.decode(dummy_heatmap, img_scale_factor=1.0)
+    
+    px_int = int(round(coords[0,0,0].item())) # 预测的整数 x 坐标
+    score_val = scores[0,0,0].item()
+    
+    print(f"原图数据: (32,32)=1.0 [Max], (32,33)=0.95, (32,34)=0.95")
+    print(f"预测坐标: {coords[0,0]}")
+    print(f"预测位置大约在整数列: {px_int}")
+    print(f"获取的 Score: {score_val}")
+    
+    # 逻辑判断：
+    # 如果预测位置还在 32，Score 应该是 1.0
+    # 如果预测位置被拉到了 33，Score 应该是 0.95 (正确对应)
+    # 绝对不能出现：位置在 33，但 Score 还是 1.0 (这是之前的 Bug)
+    
+    expected_score = dummy_heatmap[0, 0, int(round(coords[0,0,1].item())), px_int].item()
+    
+    if abs(score_val - expected_score) < 1e-4:
+         print(f"✅ 结果判定: Score ({score_val}) 正确对应了预测位置 ({px_int}) 的原图数值 (PASS)")
+    else:
+         print(f"❌ 结果判定: Score 与位置不匹配! 应该是 {expected_score}, 却得到了 {score_val} (FAIL)")
+
+def test_case_3_boundary():
+    """
+    场景 3: 边缘情况
+    验证: 峰值在图片边缘，泰勒展开不应报错，应自动跳过修正
+    """
+    print("\n--- Test Case 3: 边缘峰值安全性 ---")
+    decoder = HeatmapDecoder(use_dark=True)
+    dummy_heatmap = torch.zeros(1, 1, 64, 64)
+    
+    # 设置在极边缘 (1, 1)
+    dummy_heatmap[0, 0, 1, 1] = 1.0 
+    
+    try:
+        coords, scores = decoder.decode(dummy_heatmap, img_scale_factor=1.0)
+        print(f"预测坐标: {coords[0,0]}")
+        print("✅ 结果判定: 代码未崩溃 (PASS)")
+        
+        # 边缘通常不进行 DARK 修正，所以坐标应该是整数 (1.0, 1.0)
+        if coords[0,0,0] == 1.0:
+            print("✅ 逻辑判定: 正确跳过了边缘修正 (PASS)")
+    except Exception as e:
+        print(f"❌ 结果判定: 代码崩溃 {e} (FAIL)")
+
+# ==========================================
+# 3. 运行测试
+# ==========================================
+if __name__ == "__main__":
+    test_case_1_standard_gaussian()
+    test_case_2_peak_shift()
+    test_case_3_boundary()

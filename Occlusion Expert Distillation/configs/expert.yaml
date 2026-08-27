@@ -1,0 +1,41 @@
+seed: 42
+
+data:
+  root: "/home/duanmu/data/vitpose_v3/vitpose_v3/save_path_15"
+  image_size: 336
+  visibility_profile:
+    finger_scale: 0.12
+    finger_min: 0.5
+    finger_max: 3.5
+    palm_scale: 2.0
+    palm_min: 1.0
+    palm_max: 6.5
+    depth_scale: 1.0
+    depth_min: 0.5
+    depth_max: 3.5
+
+model:
+  base_checkpoint: "/home/duanmu/data/vitpose_v3/vitpose_v3/checkpoints/pose-epoch=52-val_mpjpe_3d=14.8132.ckpt"
+
+training:
+  batch_size: 24
+  num_workers: 8
+  pin_memory: false
+  max_epochs: 50
+  learning_rate: 0.00003
+  gnll_warmup_epochs: 0
+  scheduler_warmup_epochs: 5
+  weight_decay: 0.04
+  min_lr: 0.000001
+  w_occ: 1.0
+  w_vis: 0.1
+  early_stop_patience: 10
+
+runtime:
+  accelerator: "auto"
+  devices: 1
+  log_every_n_steps: 20
+  gradient_clip_val: 1.0
+
+output:
+  output_dir: "/home/duanmu/data/vitpose_v3/vitpose_v3/Occlusion Expert Distillation/outputs/expert"

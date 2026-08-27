@@ -1,0 +1,10 @@
+feature_dim: 768
+layers:
+- 3
+- 6
+- -1
+local_model_dir: ./dinov2-base-local
+lr: 0.0001
+num_joints: 21
+num_refine_layers: 3
+upsample_dim: 512

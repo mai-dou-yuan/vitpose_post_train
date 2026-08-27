@@ -1,0 +1,96 @@
+data:
+  # Official DexYCB source tree. Local sampled_* and splits_* folders are never scanned.
+  root: "dexycb"
+  mano_root: "dexycb"
+  # NVlabs official setup: s0 (seen), s1 (unseen subject),
+  # s2 (unseen camera), or s3 (unseen grasped object).
+  setup: "s0"
+  image_size: 224
+  val_split: "val"
+  test_split: "test"
+  use_annotation_uv: true
+  crop_padding: 1.5
+  min_crop_size: 32.0
+  # Reject unusable source frames before any augmentation. DexYCB hand pixels
+  # use segmentation id 255.
+  min_joints_in_frame: 12
+  require_hand_segmentation: true
+  require_hand_in_crop: true
+  visibility_filter_workers: 16
+  index_cache_dir: "experiments_graphormer_dexycb_light_fastvit/cache/full_dexycb_s0"
+  augmentation:
+    enabled: true
+    center_jitter: 0.07
+    scale_range: [0.85, 1.20]
+    rotation_probability: 0.60
+    max_rotation_degrees: 30.0
+    color_jitter_probability: 0.80
+    brightness: 0.20
+    contrast: 0.20
+    saturation: 0.15
+    hue: 0.03
+    degradation_probability: 0.25
+    gaussian_blur_sigma: [0.10, 1.20]
+    noise_std: [0.005, 0.020]
+    jpeg_quality: [70, 95]
+    occlusion_probability: 0.20
+    occlusion_area_range: [0.02, 0.10]
+
+training:
+  batch_size: 64
+  max_epochs: 260
+  num_workers: 8
+  # Set a positive integer explicitly, or false to use PyTorch's default.
+  # Ignored when num_workers is 0.
+  prefetch_factor: false
+  # Disabled for compatibility with the current PyTorch 2.0.1 + RTX 4090 D setup.
+  # Re-enable after upgrading PyTorch/CUDA and confirming DataLoader stability.
+  pin_memory: false
+  learning_rate: 0.0001
+  backbone_learning_rate: 0.00001
+  # Linearly ramp all optimizer parameter groups from 0.1% to their base LR.
+  # Set to 0 to disable LR warm-up.
+  lr_warmup_epochs: 5
+  # Independently keep the ViTPose backbone frozen for these initial epochs.
+  backbone_freeze_epochs: 5
+  # Transformer joint deep supervision, matching
+  # feature/initial-2d-reference-head. The stage weights are normalized at use.
+  stage_supervision_weights: [0.1, 0.3, 1.0]
+  joint_3d_loss_weight: 1.0
+  joint_2d_loss_weight: 0.02
+  initial_2d_loss_weight: 0.1
+  # Mesh supervision applies only to the projected mesh vertices.
+  vertices_loss_weight: 10.0
+  accelerator: "auto"
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0
+  log_every_n_steps: 100
+  early_stop_patience: 240
+
+model:
+  backbone: "vitpose_plus_base"
+  num_refine_layers: 3
+  vitpose_config_path: "pretrain_vitpose_pkl_and_call/vitpose_plus_base_backbone_config.py"
+  vitpose_checkpoint_path: "pretrain_vitpose_pkl_and_call/vitpose _base.pth"
+  # ViTPose++ experts: COCO/AIC/MPII/AP-10K/APT-36K/WholeBody = 0..5.
+  # WholeBody is the closest pretraining source to cropped hand images.
+  vitpose_dataset_source: 5
+  # Local CA samples a 5x5 neighbourhood spanning +/-2 feature-map cells.
+  local_grid_size: 5
+  local_grid_radius: 2.0
+  # Direct coordinate regression from a compact spatial grid; no heatmaps.
+  initial_2d_head:
+    bottleneck_channels: 16
+    pooled_height: 4
+    pooled_width: 3
+    hidden_dim: 32
+    dropout: 0.1
+  ckpt_path: ""
+
+output:
+  checkpoint_dir: "experiments_graphormer_dexycb_light_fastvit/outputs/checkpoints"
+  default_root_dir: "experiments_graphormer_dexycb_light_fastvit/outputs"
+  save_top_k: 3
+
+seed: 42

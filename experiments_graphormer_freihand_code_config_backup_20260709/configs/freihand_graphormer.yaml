@@ -1,0 +1,29 @@
+data:
+  root: "FreiHAND"
+  image_size: 224
+  val_split: "evaluation"
+  test_split: "test"
+  use_annotation_uv: true
+
+training:
+  batch_size: 48
+  max_epochs: 120
+  num_workers: 8
+  learning_rate: 0.0001
+  accelerator: "auto"
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0
+  log_every_n_steps: 20
+  early_stop_patience: 12
+
+model:
+  local_model_dir: "dinov2-base-local"
+  ckpt_path: ""
+
+output:
+  checkpoint_dir: "experiments_graphormer_freihand/outputs/checkpoints"
+  default_root_dir: "experiments_graphormer_freihand/outputs"
+  save_top_k: 3
+
+seed: 42
